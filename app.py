@@ -6,40 +6,55 @@ import sys
 import signal
 import time
 import threading
+import sqlite3
 from functools import wraps
 from flask import (Flask, request, redirect, url_for, render_template_string,
                    session, flash, send_from_directory, jsonify)
 
 app = Flask(__name__)
-app.secret_key = 'ethbd-change-this-secret-key-2025'
+app.secret_key = os.environ.get('SECRET_KEY', 'ethbd-change-this-secret-key-2025')
 
-UPLOAD_FOLDER = 'uploads'
-USERS_FILE = 'users.json'
-LOGS_FOLDER = 'logs'
+# ---- Railway/Render-এ persistent disk থাকলে এখানে পাথ দিতে হবে ----
+# উদাহরণ: Railway → /data, Render → /var/data
+DATA_DIR = os.environ.get('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
+UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
+LOGS_FOLDER = os.path.join(DATA_DIR, 'logs')
+DB_PATH = os.path.join(DATA_DIR, 'ethbd.db')
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# চলমান প্রসেস ট্র্যাকিং: {username: {filename: Popen}}
 running_processes = {}
 lock = threading.Lock()
 
 
+# ================= database =================
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL,
+        created  REAL NOT NULL
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
 # ================= helpers =================
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {}
-    with open(USERS_FILE, 'r') as f:
-        return json.load(f)
-
-
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
-
-
 def hash_password(p):
     return hashlib.sha256(p.encode()).hexdigest()
 
@@ -55,7 +70,8 @@ def login_required(f):
 
 
 def safe_filename(name):
-    return name.replace('/', '_').replace('\\', '_').replace('..', '_')
+    name = os.path.basename(name)
+    return ''.join(c for c in name if c.isalnum() or c in '._- ')[:120] or 'file.py'
 
 
 def get_log_path(user, filename):
@@ -74,50 +90,51 @@ def is_running(user, filename):
 
 
 def start_process(user, filename):
-    """ব্যাকগ্রাউন্ডে প্রসেস শুরু — ২৪/৭ চলবে যতক্ষণ Stop না করা হয়"""
     user_dir = os.path.join(UPLOAD_FOLDER, user)
     filepath = os.path.join(user_dir, filename)
-
     if not os.path.exists(filepath):
         return False, "File not found."
 
-    # আগে থেকে চললে বন্ধ করি
     if is_running(user, filename):
         stop_process(user, filename)
 
     log_path = get_log_path(user, filename)
-    open(log_path, 'w').close()  # রিসেট
+    open(log_path, 'w').close()
 
     log_f = open(log_path, 'a', buffering=1, encoding='utf-8', errors='replace')
     log_f.write(f"🚀 [{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting: {filename}\n")
-    log_f.write(f"📁 Working dir: {user_dir}\n")
     log_f.write("─" * 50 + "\n")
     log_f.flush()
 
+    # Render/Railway/Linux-এ preexec_fn কাজ করে, Windows-এ না
+    kwargs = {}
+    if os.name != 'nt':
+        kwargs['preexec_fn'] = os.setsid
+
     try:
         proc = subprocess.Popen(
-            [sys.executable, '-u', filepath],   # -u => unbuffered (লাইভ আউটপুট)
+            [sys.executable, '-u', filepath],
             stdout=log_f,
             stderr=subprocess.STDOUT,
-            cwd=user_dir,
             stdin=subprocess.DEVNULL,
-            preexec_fn=os.setsid if os.name != 'nt' else None,
+            cwd=user_dir,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            **kwargs
         )
     except Exception as e:
-        log_f.write(f"\n❌ Failed to start: {e}\n")
+        log_f.write(f"\n❌ Failed: {e}\n")
         log_f.close()
         return False, str(e)
 
     with lock:
         running_processes.setdefault(user, {})[filename] = proc
 
-    # মনিটর থ্রেড
     def monitor():
         proc.wait()
         try:
             log_f.write(f"\n{'─' * 50}\n")
             log_f.write(f"✅ [{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"Process exited with code {proc.returncode}.\n")
+                        f"Exited with code {proc.returncode}.\n")
             log_f.flush()
             log_f.close()
         except Exception:
@@ -136,14 +153,20 @@ def stop_process(user, filename):
         return False, "Not running."
     try:
         if os.name != 'nt':
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         else:
             proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             if os.name != 'nt':
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             else:
                 proc.kill()
         with lock:
@@ -154,9 +177,11 @@ def stop_process(user, filename):
 
 
 def auto_start_all():
-    """সার্ভার চালু হলে সব ইউজারের সব .py ফাইল অটো-স্টার্ট"""
-    users = load_users()
-    for username in users:
+    conn = get_db()
+    rows = conn.execute("SELECT username FROM users").fetchall()
+    conn.close()
+    for row in rows:
+        username = row['username']
         user_dir = os.path.join(UPLOAD_FOLDER, username)
         if not os.path.isdir(user_dir):
             continue
@@ -164,12 +189,12 @@ def auto_start_all():
             if fname.endswith('.py'):
                 try:
                     start_process(username, fname)
-                    print(f"   ▶ Auto-started: {username}/{fname}")
+                    print(f"   ▶ {username}/{fname}")
                 except Exception as e:
-                    print(f"   ⚠ Failed {username}/{fname}: {e}")
+                    print(f"   ⚠ {username}/{fname}: {e}")
 
 
-# ================= base layout =================
+# ================= base template =================
 BASE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -179,30 +204,25 @@ BASE = """
 <title>{% block title %}ETHBD Hosting{% endblock %}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root{
-    --bg:#0a0a0f; --card:#13131a; --card-hover:#1a1a24; --border:#26262f;
-    --text:#e6e6ee; --muted:#8b8b9a; --accent:#7c5cff; --accent-hover:#6b4bff;
-    --success:#22c55e; --error:#ef4444; --radius:12px;
-  }
+  :root{--bg:#0a0a0f;--card:#13131a;--card-hover:#1a1a24;--border:#26262f;
+    --text:#e6e6ee;--muted:#8b8b9a;--accent:#7c5cff;--accent-hover:#6b4bff;
+    --success:#22c55e;--error:#ef4444;--radius:12px;}
   *{box-sizing:border-box;margin:0;padding:0;}
   html,body{background:var(--bg);color:var(--text);
     font-family:'Inter',-apple-system,sans-serif;min-height:100vh;
     -webkit-font-smoothing:antialiased;}
-  body{
-    background:
+  body{background:
       radial-gradient(circle at 20% 0%, rgba(124,92,255,.15), transparent 40%),
       radial-gradient(circle at 80% 100%, rgba(124,92,255,.10), transparent 40%),
       var(--bg);
-    padding:16px;padding-bottom:60px;
-  }
+    padding:16px;padding-bottom:60px;}
   .container{max-width:900px;margin:0 auto;}
   header{display:flex;justify-content:space-between;align-items:center;
     padding:14px 18px;background:rgba(19,19,26,.7);border:1px solid var(--border);
     border-radius:var(--radius);backdrop-filter:blur(12px);margin-bottom:24px;}
   .logo{font-weight:700;font-size:1.1rem;
     background:linear-gradient(90deg,#7c5cff,#b794ff);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-    letter-spacing:-.02em;}
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
   nav a{color:var(--muted);text-decoration:none;margin-left:16px;
     font-size:.9rem;transition:color .2s;}
   nav a:hover{color:var(--text);}
@@ -211,35 +231,30 @@ BASE = """
   h2{font-size:1.3rem;margin-bottom:16px;}
   p{color:var(--muted);line-height:1.6;}
   .card{background:var(--card);border:1px solid var(--border);
-    border-radius:var(--radius);padding:24px;margin-bottom:20px;
-    transition:border-color .2s;}
-  .card:hover{border-color:#33333f;}
+    border-radius:var(--radius);padding:24px;margin-bottom:20px;}
   label{display:block;font-size:.85rem;color:var(--muted);
     margin-bottom:6px;font-weight:500;}
   input[type=text],input[type=password],input[type=file]{
     width:100%;background:#0e0e14;border:1px solid var(--border);
     color:var(--text);padding:12px 14px;border-radius:10px;
-    font-size:1rem;margin-bottom:16px;font-family:inherit;
-    transition:border-color .2s;}
+    font-size:1rem;margin-bottom:16px;font-family:inherit;}
   input[type=file]{padding:10px;}
   input:focus{outline:none;border-color:var(--accent);
     box-shadow:0 0 0 3px rgba(124,92,255,.15);}
   .btn{display:inline-flex;align-items:center;justify-content:center;
     gap:8px;background:var(--accent);color:#fff;border:none;
     padding:12px 22px;border-radius:10px;font-size:.95rem;
-    font-weight:600;cursor:pointer;transition:background .2s,transform .1s;
-    font-family:inherit;width:100%;text-decoration:none;}
+    font-weight:600;cursor:pointer;font-family:inherit;width:100%;
+    text-decoration:none;transition:background .2s,transform .1s;}
   .btn:hover{background:var(--accent-hover);}
   .btn:active{transform:scale(.98);}
   .btn:disabled{opacity:.55;cursor:not-allowed;}
   .btn-sm{width:auto;padding:8px 14px;font-size:.85rem;}
   .btn-ghost{background:transparent;border:1px solid var(--border);
     color:var(--text);}
-  .btn-ghost:hover{background:var(--card-hover);border-color:#3a3a48;}
+  .btn-ghost:hover{background:var(--card-hover);}
   .btn-run{background:linear-gradient(90deg,#22c55e,#16a34a);}
-  .btn-run:hover{background:linear-gradient(90deg,#16a34a,#15803d);}
   .btn-stop{background:linear-gradient(90deg,#ef4444,#dc2626);}
-  .btn-stop:hover{background:linear-gradient(90deg,#dc2626,#b91c1c);}
   .flash{padding:12px 16px;border-radius:10px;margin-bottom:16px;
     font-size:.9rem;border:1px solid;}
   .flash.success{background:rgba(34,197,94,.1);color:#86efac;
@@ -247,8 +262,7 @@ BASE = """
   .flash.error{background:rgba(239,68,68,.1);color:#fca5a5;
     border-color:rgba(239,68,68,.3);}
   .file-item{background:#0e0e14;border:1px solid var(--border);
-    border-radius:10px;margin-bottom:14px;overflow:hidden;
-    transition:border-color .2s;}
+    border-radius:10px;margin-bottom:14px;overflow:hidden;}
   .file-item.running{border-color:rgba(34,197,94,.35);}
   .file-header{display:flex;justify-content:space-between;align-items:center;
     gap:12px;padding:12px 14px;flex-wrap:wrap;}
@@ -256,12 +270,10 @@ BASE = """
     color:var(--text);word-break:break-all;flex:1;min-width:150px;
     display:flex;align-items:center;gap:8px;}
   .status-dot{width:9px;height:9px;border-radius:50%;background:#555;
-    display:inline-block;flex-shrink:0;transition:background .3s;}
+    display:inline-block;flex-shrink:0;}
   .status-dot.running{background:#22c55e;
-    box-shadow:0 0 10px rgba(34,197,94,.9);
-    animation:pulse 1.4s infinite;}
-  @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}
-    50%{opacity:.5;transform:scale(1.2);}}
+    box-shadow:0 0 10px rgba(34,197,94,.9);animation:pulse 1.4s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
   .file-actions{display:flex;gap:8px;flex-wrap:wrap;}
   .output-wrap{padding:0 14px 14px;}
   .output-box{background:#06060a;border:1px solid var(--border);
@@ -273,7 +285,6 @@ BASE = """
   .output-head{display:flex;justify-content:space-between;align-items:center;
     padding:8px 0 6px;font-size:.72rem;color:var(--muted);
     text-transform:uppercase;letter-spacing:.08em;}
-  .output-head .live{color:#22c55e;display:inline-flex;align-items:center;gap:5px;}
   .spinner{width:11px;height:11px;border:2px solid rgba(124,92,255,.25);
     border-top-color:#7c5cff;border-radius:50%;
     animation:spin .7s linear infinite;display:inline-block;
@@ -284,20 +295,18 @@ BASE = """
   .hero h1{font-size:2rem;margin-bottom:12px;}
   .hero p{max-width:520px;margin:0 auto 24px;}
   .auth-link{color:var(--accent);text-decoration:none;font-weight:600;}
-  .auth-link:hover{text-decoration:underline;}
   .muted{color:var(--muted);font-size:.85rem;}
   .badge{display:inline-block;padding:3px 9px;border-radius:20px;
     font-size:.7rem;background:rgba(124,92,255,.15);color:#b794ff;
     border:1px solid rgba(124,92,255,.3);margin-left:6px;}
   @media (max-width:520px){
-    h1{font-size:1.5rem;}
-    .hero h1{font-size:1.6rem;}
+    h1{font-size:1.5rem;}.hero h1{font-size:1.6rem;}
     .card{padding:18px;}
     header{padding:12px 14px;}
     nav a{margin-left:12px;font-size:.82rem;}
     .file-header{flex-direction:column;align-items:stretch;}
     .file-actions{justify-content:stretch;}
-    .file-actions .btn{flex:1;min-width:0;}
+    .file-actions .btn{flex:1;}
     .output-box{height:240px;font-size:.72rem;}
   }
 </style>
@@ -316,45 +325,40 @@ BASE = """
       {% endif %}
     </nav>
   </header>
-
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, msg in messages %}
       <div class="flash {{ category }}">{{ msg }}</div>
     {% endfor %}
   {% endwith %}
-
   {% block content %}{% endblock %}
 </div>
 </body>
 </html>
 """
 
-
-# ================= pages =================
 INDEX_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card hero">
   <h1>Host &amp; Run Python <span class="badge">24/7</span></h1>
-  <p>Upload Python files — they auto-start instantly and run 24/7. Watch live output in real time. Works perfectly on mobile.</p>
+  <p>Upload a Python file — it auto-starts instantly and runs 24/7. Watch live output. Works great on mobile.</p>
   <div style="display:flex;gap:10px;max-width:340px;margin:0 auto;">
     <a href="{{ url_for('register') }}" class="btn">Get Started</a>
     <a href="{{ url_for('login') }}" class="btn btn-ghost">Login</a>
   </div>
 </div>
 {% endblock %}
-""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Welcome — ETHBD Hosting")
-
+""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Welcome — ETHBD")
 
 REGISTER_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card" style="max-width:420px;margin:0 auto;">
   <h2>Create Account 🚀</h2>
-  <p class="muted" style="margin-bottom:20px;">Register once and start hosting your Python files 24/7.</p>
+  <p class="muted" style="margin-bottom:20px;">Register once, start hosting 24/7.</p>
   <form method="post">
     <label>Username</label>
-    <input type="text" name="username" placeholder="Choose a username" required autocomplete="username">
+    <input type="text" name="username" placeholder="Username" required>
     <label>Password</label>
-    <input type="password" name="password" placeholder="Choose a password" required autocomplete="new-password">
+    <input type="password" name="password" placeholder="Password" required>
     <button class="btn" type="submit">Register</button>
   </form>
   <p class="muted center" style="margin-top:16px;">
@@ -362,19 +366,18 @@ REGISTER_PAGE = BASE.replace("{% block content %}{% endblock %}", """
   </p>
 </div>
 {% endblock %}
-""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Register — ETHBD Hosting")
-
+""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Register — ETHBD")
 
 LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card" style="max-width:420px;margin:0 auto;">
   <h2>Welcome Back 👋</h2>
-  <p class="muted" style="margin-bottom:20px;">Login to access your hosted files.</p>
+  <p class="muted" style="margin-bottom:20px;">Login to access your files.</p>
   <form method="post">
     <label>Username</label>
-    <input type="text" name="username" placeholder="Your username" required autocomplete="username">
+    <input type="text" name="username" placeholder="Username" required>
     <label>Password</label>
-    <input type="password" name="password" placeholder="Your password" required autocomplete="current-password">
+    <input type="password" name="password" placeholder="Password" required>
     <button class="btn" type="submit">Login</button>
   </form>
   <p class="muted center" style="margin-top:16px;">
@@ -382,14 +385,13 @@ LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", """
   </p>
 </div>
 {% endblock %}
-""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Login — ETHBD Hosting")
-
+""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Login — ETHBD")
 
 DASHBOARD_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card">
   <h2>Hello, {{ user }} 👋</h2>
-  <p class="muted">Upload a <b>.py</b> file — it starts running immediately and keeps running 24/7 until you press Stop.</p>
+  <p class="muted">Upload a <b>.py</b> file — it auto-starts and runs 24/7 until you press Stop.</p>
 </div>
 
 <div class="card">
@@ -428,146 +430,104 @@ DASHBOARD_PAGE = BASE.replace("{% block content %}{% endblock %}", """
         </div>
         <div class="output-wrap" style="display:none;">
           <div class="output-head">
-            <span id="head-{{ loop.index }}">
-              <span class="spinner"></span>Loading output...
-            </span>
-            <span class="muted" id="time-{{ loop.index }}"></span>
+            <span><span class="spinner"></span>Loading output...</span>
+            <span class="muted"></span>
           </div>
-          <div class="output-box" id="box-{{ loop.index }}"></div>
+          <div class="output-box"></div>
         </div>
       </div>
     {% endfor %}
   {% else %}
-    <p class="muted">No files uploaded yet. Upload your first Python file above ☝️</p>
+    <p class="muted">No files yet. Upload one above ☝️</p>
   {% endif %}
 </div>
 
 <script>
-const pollers = {};
-const lastLog = {};
-const loadingState = {};
+const pollers = {}, lastLog = {}, loading = {};
 
 function escapeHtml(s){
   return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;',
     '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-
-function getItem(filename){
-  return document.querySelector('.file-item[data-file="' +
-    CSS.escape(filename) + '"]');
+function getItem(f){
+  return document.querySelector('.file-item[data-file="'+CSS.escape(f)+'"]');
 }
 
-async function startFile(filename, btn){
-  btn.disabled = true;
-  btn.textContent = '⏳ Starting...';
+async function startFile(f, btn){
+  btn.disabled = true; btn.textContent = '⏳ Starting...';
   try{
-    const res = await fetch('/start/' + encodeURIComponent(filename),
-      {method:'POST'});
-    const data = await res.json();
-    if(data.ok){
-      const item = getItem(filename);
+    const r = await fetch('/start/'+encodeURIComponent(f), {method:'POST'});
+    const d = await r.json();
+    if(d.ok){
+      const item = getItem(f);
       item.dataset.running = '1';
       item.classList.add('running');
       item.querySelector('.status-dot').classList.add('running');
       item.querySelector('.run-btn').style.display = 'none';
       item.querySelector('.stop-btn').style.display = '';
-      const wrap = item.querySelector('.output-wrap');
-      wrap.style.display = 'block';
-      showLoading(filename);
-      startPolling(filename);
-    } else {
-      alert('Error: ' + (data.error || 'unknown'));
-    }
-  }catch(e){ alert('Error: ' + e); }
+      item.querySelector('.output-wrap').style.display = 'block';
+      loading[f] = true;
+      startPolling(f);
+    } else alert('Error: ' + (d.error || 'unknown'));
+  }catch(e){ alert(e); }
   finally{ btn.disabled = false; btn.textContent = '▶ Run'; }
 }
 
-async function stopFile(filename, btn){
-  btn.disabled = true;
-  btn.textContent = '⏳ Stopping...';
+async function stopFile(f, btn){
+  btn.disabled = true; btn.textContent = '⏳ Stopping...';
   try{
-    await fetch('/stop/' + encodeURIComponent(filename), {method:'POST'});
-    const item = getItem(filename);
+    await fetch('/stop/'+encodeURIComponent(f), {method:'POST'});
+    const item = getItem(f);
     item.dataset.running = '0';
     item.classList.remove('running');
     item.querySelector('.status-dot').classList.remove('running');
     item.querySelector('.run-btn').style.display = '';
     item.querySelector('.stop-btn').style.display = 'none';
-    stopPolling(filename);
-    fetchLog(filename);  // শেষ লগটা দেখাই
-  }catch(e){ alert('Error: ' + e); }
+    stopPolling(f); fetchLog(f);
+  }catch(e){ alert(e); }
   finally{ btn.disabled = false; btn.textContent = '■ Stop'; }
 }
 
-function showLoading(filename){
-  const item = getItem(filename);
-  const head = item.querySelector('.output-head span:first-child');
-  const box = item.querySelector('.output-box');
-  head.innerHTML = '<span class="spinner"></span>Loading output...';
-  box.innerHTML = '';
-  loadingState[filename] = true;
-}
-
-async function fetchLog(filename){
+async function fetchLog(f){
   try{
-    const res = await fetch('/log/' + encodeURIComponent(filename));
-    const data = await res.json();
-    const item = getItem(filename);
+    const r = await fetch('/log/'+encodeURIComponent(f));
+    const d = await r.json();
+    const item = getItem(f);
     const head = item.querySelector('.output-head span:first-child');
     const timeEl = item.querySelector('.output-head span:last-child');
     const box = item.querySelector('.output-box');
-    const log = data.log || '';
+    const log = d.log || '';
     const isRun = item.dataset.running === '1';
 
-    // প্রথম লোডিং শেষ হলে হেড আপডেট
-    if(loadingState[filename] && log.length > 0){
-      loadingState[filename] = false;
-    }
+    if(loading[f] && log.length > 0) loading[f] = false;
 
-    if(loadingState[filename]){
-      head.innerHTML = '<span class="spinner"></span>Loading output...';
-    } else if(isRun){
-      head.innerHTML = '<span class="live">● Live Output</span>';
-    } else {
-      head.innerHTML = 'Final Output';
-    }
+    if(loading[f]) head.innerHTML = '<span class="spinner"></span>Loading output...';
+    else if(isRun) head.innerHTML = '<span style="color:#22c55e">● Live Output</span>';
+    else head.innerHTML = 'Final Output';
     timeEl.textContent = new Date().toLocaleTimeString();
 
-    // এরর ডিটেকশন
-    const hasError = /Traceback|Error:|Exception|\\u274c/i.test(log);
+    const hasError = /Traceback|Error:|Exception|❌/i.test(log);
 
-    // content আপডেট — শুধু বদলালে
-    if(lastLog[filename] !== log){
-      lastLog[filename] = log;
-      const wasBottom =
-        box.scrollHeight - box.scrollTop - box.clientHeight < 60;
-
-      if(!log){
-        box.innerHTML = loadingState[filename]
-          ? '<span style="color:#555">Waiting for output...</span>'
-          : '<span style="color:#555">(no output)</span>';
-      } else {
-        box.innerHTML = escapeHtml(log);
-      }
-      if(hasError) box.classList.add('error');
-      else box.classList.remove('error');
-
+    if(lastLog[f] !== log){
+      lastLog[f] = log;
+      const wasBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+      box.innerHTML = log ? escapeHtml(log)
+        : '<span style="color:#555">Waiting for output...</span>';
+      box.classList.toggle('error', hasError);
       if(wasBottom) box.scrollTop = box.scrollHeight;
     }
-  }catch(e){ /* নীরব */ }
+  }catch(e){}
 }
 
-function startPolling(filename){
-  if(pollers[filename]) return;
-  fetchLog(filename);
-  pollers[filename] = setInterval(async () => {
-    const item = getItem(filename);
-    if(!item){ clearInterval(pollers[filename]);
-      delete pollers[filename]; return; }
-    await fetchLog(filename);
-    // স্টেটাস সিঙ্ক
+function startPolling(f){
+  if(pollers[f]) return;
+  fetchLog(f);
+  pollers[f] = setInterval(async () => {
+    const item = getItem(f);
+    if(!item){ clearInterval(pollers[f]); delete pollers[f]; return; }
+    await fetchLog(f);
     try{
-      const r = await fetch('/status/' + encodeURIComponent(filename));
+      const r = await fetch('/status/'+encodeURIComponent(f));
       const s = await r.json();
       if(!s.running && item.dataset.running === '1'){
         item.dataset.running = '0';
@@ -575,34 +535,25 @@ function startPolling(filename){
         item.querySelector('.status-dot').classList.remove('running');
         item.querySelector('.run-btn').style.display = '';
         item.querySelector('.stop-btn').style.display = 'none';
-        clearInterval(pollers[filename]);
-        delete pollers[filename];
-        fetchLog(filename);
+        clearInterval(pollers[f]); delete pollers[f];
+        fetchLog(f);
       }
     }catch(e){}
-  }, 1200);
+  }, 1500);
 }
+function stopPolling(f){ if(pollers[f]){ clearInterval(pollers[f]); delete pollers[f]; } }
 
-function stopPolling(filename){
-  if(pollers[filename]){
-    clearInterval(pollers[filename]);
-    delete pollers[filename];
-  }
-}
-
-// পেজ লোডে চলমান সব ফাইলের পোলিং চালু
 document.querySelectorAll('.file-item').forEach(item => {
-  const wrap = item.querySelector('.output-wrap');
-  if(wrap) wrap.style.display = 'block';
+  const w = item.querySelector('.output-wrap');
+  if(w) w.style.display = 'block';
   startPolling(item.dataset.file);
 });
-
 window.addEventListener('beforeunload', () => {
   Object.values(pollers).forEach(clearInterval);
 });
 </script>
 {% endblock %}
-""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Dashboard — ETHBD Hosting")
+""").replace("{% block title %}ETHBD Hosting{% endblock %}", "Dashboard — ETHBD")
 
 
 # ================= routes =================
@@ -616,20 +567,24 @@ def index():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
-        if not username or not password:
+        u = request.form.get('username', '').strip()
+        p = request.form.get('password', '')
+        if not u or not p:
             flash('Username and password required.', 'error')
             return redirect(url_for('register'))
-        users = load_users()
-        if username in users:
+        conn = get_db()
+        try:
+            conn.execute("INSERT INTO users (username, password, created) VALUES (?,?,?)",
+                         (u, hash_password(p), time.time()))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
             flash('Username already taken.', 'error')
             return redirect(url_for('register'))
-        users[username] = {'password': hash_password(password)}
-        save_users(users)
-        os.makedirs(os.path.join(UPLOAD_FOLDER, username), exist_ok=True)
-        session['user'] = username
-        flash('Account created! 🎉 You can start uploading now.', 'success')
+        conn.close()
+        os.makedirs(os.path.join(UPLOAD_FOLDER, u), exist_ok=True)
+        session['user'] = u
+        flash('Account created! 🎉', 'success')
         return redirect(url_for('dashboard'))
     return render_template_string(REGISTER_PAGE)
 
@@ -637,11 +592,14 @@ def register():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
-        users = load_users()
-        if username in users and users[username]['password'] == hash_password(password):
-            session['user'] = username
+        u = request.form.get('username', '').strip()
+        p = request.form.get('password', '')
+        conn = get_db()
+        row = conn.execute("SELECT password FROM users WHERE username=?",
+                           (u,)).fetchone()
+        conn.close()
+        if row and row['password'] == hash_password(p):
+            session['user'] = u
             flash('Logged in! ✅', 'success')
             return redirect(url_for('dashboard'))
         flash('Invalid username or password.', 'error')
@@ -663,8 +621,8 @@ def dashboard():
     os.makedirs(user_dir, exist_ok=True)
     files = sorted(os.listdir(user_dir))
     running = [f for f in files if is_running(user, f)]
-    return render_template_string(DASHBOARD_PAGE, user=user,
-                                  files=files, running=running)
+    return render_template_string(DASHBOARD_PAGE,
+                                  user=user, files=files, running=running)
 
 
 @app.route('/upload', methods=['POST'])
@@ -674,17 +632,15 @@ def upload_file():
     user_dir = os.path.join(UPLOAD_FOLDER, user)
     os.makedirs(user_dir, exist_ok=True)
     if 'file' in request.files:
-        file = request.files['file']
-        if file.filename:
-            fname = safe_filename(file.filename)
-            path = os.path.join(user_dir, fname)
-            file.save(path)
-            flash(f'File "{fname}" uploaded ✅', 'success')
-            # ⚡ অটো-স্টার্ট .py ফাইল
+        f = request.files['file']
+        if f.filename:
+            fname = safe_filename(f.filename)
+            f.save(os.path.join(user_dir, fname))
+            flash(f'Uploaded "{fname}" ✅', 'success')
             if fname.endswith('.py'):
                 ok, msg = start_process(user, fname)
                 if ok:
-                    flash(f'Auto-started "{fname}" 🚀 Running 24/7.', 'success')
+                    flash(f'Auto-started "{fname}" 🚀', 'success')
                 else:
                     flash(f'Auto-start failed: {msg}', 'error')
     return redirect(url_for('dashboard'))
@@ -696,9 +652,9 @@ def start_file(filename):
     user = session['user']
     filename = safe_filename(filename)
     if not filename.endswith('.py'):
-        return jsonify({'ok': False, 'error': 'Only .py files can run.'})
+        return jsonify({'ok': False, 'error': 'Only .py files.'})
     if is_running(user, filename):
-        return jsonify({'ok': True, 'msg': 'Already running.'})
+        return jsonify({'ok': True})
     ok, msg = start_process(user, filename)
     return jsonify({'ok': ok, 'error': None if ok else msg})
 
@@ -716,8 +672,7 @@ def stop_file(filename):
 @login_required
 def status_file(filename):
     user = session['user']
-    filename = safe_filename(filename)
-    return jsonify({'running': is_running(user, filename)})
+    return jsonify({'running': is_running(user, safe_filename(filename))})
 
 
 @app.route('/log/<filename>')
@@ -732,7 +687,7 @@ def log_file(filename):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             data = f.read()
         if len(data) > 100_000:
-            data = '...[truncated older output]...\n' + data[-100_000:]
+            data = '...[truncated]...\n' + data[-100_000:]
         return jsonify({'log': data})
     except Exception as e:
         return jsonify({'log': '', 'error': str(e)})
@@ -745,17 +700,18 @@ def download_file(filename):
     return send_from_directory(os.path.join(UPLOAD_FOLDER, user), filename)
 
 
-# ================= run =================
-if __name__ == '__main__':
-    print("\n🔄 Auto-starting all previously uploaded .py files...")
+# ---- auto-start on app boot (gunicorn-এর সাথে কাজ করে) ----
+try:
     auto_start_all()
-    print("✅ Auto-start complete.\n")
+except Exception as e:
+    print(f"Auto-start error: {e}")
 
+
+if __name__ == '__main__':
     try:
         from pyngrok import ngrok
-        public_url = ngrok.connect(5000).public_url
-        print(f"🌍 Public URL: {public_url}\n")
-    except Exception as e:
-        print(f"⚠ ngrok off ({e}). Local: http://localhost:5000\n")
-
+        url = ngrok.connect(5000).public_url
+        print(f"\n🌍 {url}\n")
+    except Exception:
+        print("\n⚠ http://localhost:5000\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
