@@ -20,14 +20,14 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
-# চলমান প্রসেস ট্র্যাকিং: {username: {filename: Popen object}}
+# চলমান প্রসেস ট্র্যাকিং: {username: {filename: Popen}}
 running_processes = {}
 lock = threading.Lock()
 
 
-# ---------------- helpers ----------------
+# ================= helpers =================
 def load_users():
     if not os.path.exists(USERS_FILE):
         return {}
@@ -54,8 +54,12 @@ def login_required(f):
     return wrapper
 
 
+def safe_filename(name):
+    return name.replace('/', '_').replace('\\', '_').replace('..', '_')
+
+
 def get_log_path(user, filename):
-    return os.path.join(LOGS_FOLDER, f"{user}__{filename}.log")
+    return os.path.join(LOGS_FOLDER, f"{user}__{safe_filename(filename)}.log")
 
 
 def is_running(user, filename):
@@ -70,29 +74,34 @@ def is_running(user, filename):
 
 
 def start_process(user, filename):
-    """ব্যাকগ্রাউন্ডে ফাইল রান শুরু করে, লগ ফাইলে আউটপুট লেখে"""
+    """ব্যাকগ্রাউন্ডে প্রসেস শুরু — ২৪/৭ চলবে যতক্ষণ Stop না করা হয়"""
     user_dir = os.path.join(UPLOAD_FOLDER, user)
     filepath = os.path.join(user_dir, filename)
+
     if not os.path.exists(filepath):
         return False, "File not found."
 
+    # আগে থেকে চললে বন্ধ করি
+    if is_running(user, filename):
+        stop_process(user, filename)
+
     log_path = get_log_path(user, filename)
+    open(log_path, 'w').close()  # রিসেট
 
-    # পুরনো লগ মুছে ফেলি
-    open(log_path, 'w').close()
-
-    # Python unbuffered mode (-u) -> লাইভ আউটপুট পাব
-    log_f = open(log_path, 'a', buffering=1)
-    log_f.write(f"🚀 [{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting {filename}...\n\n")
+    log_f = open(log_path, 'a', buffering=1, encoding='utf-8', errors='replace')
+    log_f.write(f"🚀 [{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting: {filename}\n")
+    log_f.write(f"📁 Working dir: {user_dir}\n")
+    log_f.write("─" * 50 + "\n")
     log_f.flush()
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, '-u', filepath],
+            [sys.executable, '-u', filepath],   # -u => unbuffered (লাইভ আউটপুট)
             stdout=log_f,
             stderr=subprocess.STDOUT,
             cwd=user_dir,
-            preexec_fn=os.setsid,   # আলাদা process group -> পুরো ট্রি kill করা যাবে
+            stdin=subprocess.DEVNULL,
+            preexec_fn=os.setsid if os.name != 'nt' else None,
         )
     except Exception as e:
         log_f.write(f"\n❌ Failed to start: {e}\n")
@@ -102,12 +111,13 @@ def start_process(user, filename):
     with lock:
         running_processes.setdefault(user, {})[filename] = proc
 
-    # মনিটর থ্রেড -> প্রসেস শেষ হলে লগে লেখে
+    # মনিটর থ্রেড
     def monitor():
         proc.wait()
         try:
-            log_f.write(f"\n\n✅ [{time.strftime('%Y-%m-%d %H:%M:%S')}] Process exited "
-                        f"with code {proc.returncode}.\n")
+            log_f.write(f"\n{'─' * 50}\n")
+            log_f.write(f"✅ [{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Process exited with code {proc.returncode}.\n")
             log_f.flush()
             log_f.close()
         except Exception:
@@ -125,11 +135,17 @@ def stop_process(user, filename):
     if proc is None or proc.poll() is not None:
         return False, "Not running."
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        if os.name != 'nt':
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
         try:
-            proc.wait(timeout=3)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            if os.name != 'nt':
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
         with lock:
             running_processes.get(user, {}).pop(filename, None)
         return True, "Stopped."
@@ -137,7 +153,23 @@ def stop_process(user, filename):
         return False, str(e)
 
 
-# ---------------- base layout ----------------
+def auto_start_all():
+    """সার্ভার চালু হলে সব ইউজারের সব .py ফাইল অটো-স্টার্ট"""
+    users = load_users()
+    for username in users:
+        user_dir = os.path.join(UPLOAD_FOLDER, username)
+        if not os.path.isdir(user_dir):
+            continue
+        for fname in os.listdir(user_dir):
+            if fname.endswith('.py'):
+                try:
+                    start_process(username, fname)
+                    print(f"   ▶ Auto-started: {username}/{fname}")
+                except Exception as e:
+                    print(f"   ⚠ Failed {username}/{fname}: {e}")
+
+
+# ================= base layout =================
 BASE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -199,7 +231,7 @@ BASE = """
     font-family:inherit;width:100%;text-decoration:none;}
   .btn:hover{background:var(--accent-hover);}
   .btn:active{transform:scale(.98);}
-  .btn:disabled{opacity:.6;cursor:not-allowed;}
+  .btn:disabled{opacity:.55;cursor:not-allowed;}
   .btn-sm{width:auto;padding:8px 14px;font-size:.85rem;}
   .btn-ghost{background:transparent;border:1px solid var(--border);
     color:var(--text);}
@@ -214,32 +246,43 @@ BASE = """
     border-color:rgba(34,197,94,.3);}
   .flash.error{background:rgba(239,68,68,.1);color:#fca5a5;
     border-color:rgba(239,68,68,.3);}
-  .file-item{display:flex;justify-content:space-between;align-items:center;
-    gap:12px;padding:12px 14px;background:#0e0e14;border:1px solid var(--border);
-    border-radius:10px;margin-bottom:10px;flex-wrap:wrap;}
+  .file-item{background:#0e0e14;border:1px solid var(--border);
+    border-radius:10px;margin-bottom:14px;overflow:hidden;
+    transition:border-color .2s;}
+  .file-item.running{border-color:rgba(34,197,94,.35);}
+  .file-header{display:flex;justify-content:space-between;align-items:center;
+    gap:12px;padding:12px 14px;flex-wrap:wrap;}
   .file-name{font-family:'JetBrains Mono',monospace;font-size:.88rem;
     color:var(--text);word-break:break-all;flex:1;min-width:150px;
     display:flex;align-items:center;gap:8px;}
-  .status-dot{width:8px;height:8px;border-radius:50%;background:#555;
-    display:inline-block;flex-shrink:0;}
+  .status-dot{width:9px;height:9px;border-radius:50%;background:#555;
+    display:inline-block;flex-shrink:0;transition:background .3s;}
   .status-dot.running{background:#22c55e;
-    box-shadow:0 0 8px rgba(34,197,94,.8);
-    animation:pulse 1.5s infinite;}
-  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
+    box-shadow:0 0 10px rgba(34,197,94,.9);
+    animation:pulse 1.4s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}
+    50%{opacity:.5;transform:scale(1.2);}}
   .file-actions{display:flex;gap:8px;flex-wrap:wrap;}
-  .output-box{background:#08080c;border:1px solid var(--border);
-    border-radius:10px;padding:14px;margin-top:12px;
-    font-family:'JetBrains Mono',monospace;font-size:.8rem;
-    white-space:pre-wrap;word-break:break-word;max-height:340px;
-    overflow-y:auto;color:#c9d1d9;width:100%;}
-  .output-box.error{color:#fca5a5;border-color:rgba(239,68,68,.3);}
-  .output-box .label{color:var(--muted);font-size:.7rem;
-    text-transform:uppercase;letter-spacing:.08em;display:block;
-    margin-bottom:6px;}
+  .output-wrap{padding:0 14px 14px;}
+  .output-box{background:#06060a;border:1px solid var(--border);
+    border-radius:10px;padding:14px;
+    font-family:'JetBrains Mono',monospace;font-size:.78rem;
+    white-space:pre-wrap;word-break:break-word;
+    height:300px;overflow-y:auto;color:#c9d1d9;line-height:1.55;}
+  .output-box.error{color:#fca5a5;border-color:rgba(239,68,68,.4);}
+  .output-head{display:flex;justify-content:space-between;align-items:center;
+    padding:8px 0 6px;font-size:.72rem;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.08em;}
+  .output-head .live{color:#22c55e;display:inline-flex;align-items:center;gap:5px;}
+  .spinner{width:11px;height:11px;border:2px solid rgba(124,92,255,.25);
+    border-top-color:#7c5cff;border-radius:50%;
+    animation:spin .7s linear infinite;display:inline-block;
+    vertical-align:middle;margin-right:6px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
   .center{text-align:center;}
   .hero{text-align:center;padding:32px 8px;}
   .hero h1{font-size:2rem;margin-bottom:12px;}
-  .hero p{max-width:500px;margin:0 auto 24px;}
+  .hero p{max-width:520px;margin:0 auto 24px;}
   .auth-link{color:var(--accent);text-decoration:none;font-weight:600;}
   .auth-link:hover{text-decoration:underline;}
   .muted{color:var(--muted);font-size:.85rem;}
@@ -252,9 +295,10 @@ BASE = """
     .card{padding:18px;}
     header{padding:12px 14px;}
     nav a{margin-left:12px;font-size:.82rem;}
-    .file-item{flex-direction:column;align-items:stretch;}
+    .file-header{flex-direction:column;align-items:stretch;}
     .file-actions{justify-content:stretch;}
-    .file-actions .btn{flex:1;}
+    .file-actions .btn{flex:1;min-width:0;}
+    .output-box{height:240px;font-size:.72rem;}
   }
 </style>
 </head>
@@ -286,12 +330,12 @@ BASE = """
 """
 
 
-# ---------------- pages ----------------
+# ================= pages =================
 INDEX_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card hero">
-  <h1>Host &amp; Run Python <span class="badge">Premium</span></h1>
-  <p>Upload Python files, run them forever in the background, watch live output. Works great on mobile.</p>
+  <h1>Host &amp; Run Python <span class="badge">24/7</span></h1>
+  <p>Upload Python files — they auto-start instantly and run 24/7. Watch live output in real time. Works perfectly on mobile.</p>
   <div style="display:flex;gap:10px;max-width:340px;margin:0 auto;">
     <a href="{{ url_for('register') }}" class="btn">Get Started</a>
     <a href="{{ url_for('login') }}" class="btn btn-ghost">Login</a>
@@ -305,7 +349,7 @@ REGISTER_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card" style="max-width:420px;margin:0 auto;">
   <h2>Create Account 🚀</h2>
-  <p class="muted" style="margin-bottom:20px;">Register once and start hosting your Python files.</p>
+  <p class="muted" style="margin-bottom:20px;">Register once and start hosting your Python files 24/7.</p>
   <form method="post">
     <label>Username</label>
     <input type="text" name="username" placeholder="Choose a username" required autocomplete="username">
@@ -345,15 +389,15 @@ DASHBOARD_PAGE = BASE.replace("{% block content %}{% endblock %}", """
 {% block content %}
 <div class="card">
   <h2>Hello, {{ user }} 👋</h2>
-  <p class="muted">Upload, run, and manage your Python files. Processes run forever until you stop them.</p>
+  <p class="muted">Upload a <b>.py</b> file — it starts running immediately and keeps running 24/7 until you press Stop.</p>
 </div>
 
 <div class="card">
-  <h2>📤 Upload File</h2>
+  <h2>📤 Upload &amp; Auto-Run</h2>
   <form action="{{ url_for('upload_file') }}" method="post" enctype="multipart/form-data">
-    <label>Choose a file (max 20MB)</label>
-    <input type="file" name="file" required>
-    <button class="btn" type="submit">Upload</button>
+    <label>Choose a Python file (.py)</label>
+    <input type="file" name="file" accept=".py" required>
+    <button class="btn" type="submit">Upload &amp; Run</button>
   </form>
 </div>
 
@@ -362,55 +406,74 @@ DASHBOARD_PAGE = BASE.replace("{% block content %}{% endblock %}", """
   {% if files %}
     {% for file in files %}
       {% set running = file in running %}
-      <div class="file-item" data-file="{{ file }}" data-running="{{ '1' if running else '0' }}">
-        <div class="file-name">
-          <span class="status-dot {{ 'running' if running else '' }}"></span>
-          📄 {{ file }}
+      <div class="file-item {{ 'running' if running else '' }}"
+           data-file="{{ file }}" data-running="{{ '1' if running else '0' }}">
+        <div class="file-header">
+          <div class="file-name">
+            <span class="status-dot {{ 'running' if running else '' }}"></span>
+            📄 {{ file }}
+          </div>
+          <div class="file-actions">
+            <a href="{{ url_for('download_file', filename=file) }}"
+               class="btn btn-ghost btn-sm">Download</a>
+            {% if file.endswith('.py') %}
+              <button class="btn btn-run btn-sm run-btn"
+                      onclick="startFile('{{ file }}', this)"
+                      {% if running %}style="display:none"{% endif %}>▶ Run</button>
+              <button class="btn btn-stop btn-sm stop-btn"
+                      onclick="stopFile('{{ file }}', this)"
+                      {% if not running %}style="display:none"{% endif %}>■ Stop</button>
+            {% endif %}
+          </div>
         </div>
-        <div class="file-actions">
-          <a href="{{ url_for('download_file', filename=file) }}" class="btn btn-ghost btn-sm">Download</a>
-          {% if file.endswith('.py') %}
-            <button class="btn btn-run btn-sm run-btn" onclick="startFile('{{ file }}', this)"
-                    {% if running %}style="display:none"{% endif %}>▶ Run</button>
-            <button class="btn btn-stop btn-sm stop-btn" onclick="stopFile('{{ file }}', this)"
-                    {% if not running %}style="display:none"{% endif %}>■ Stop</button>
-            <button class="btn btn-ghost btn-sm" onclick="toggleLog('{{ file }}', this)">📜 Log</button>
-          {% endif %}
-        </div>
-        <div class="output-box" style="display:none;">
-          <span class="label">Loading...</span>
+        <div class="output-wrap" style="display:none;">
+          <div class="output-head">
+            <span id="head-{{ loop.index }}">
+              <span class="spinner"></span>Loading output...
+            </span>
+            <span class="muted" id="time-{{ loop.index }}"></span>
+          </div>
+          <div class="output-box" id="box-{{ loop.index }}"></div>
         </div>
       </div>
     {% endfor %}
   {% else %}
-    <p class="muted">No files uploaded yet. Upload your first file above ☝️</p>
+    <p class="muted">No files uploaded yet. Upload your first Python file above ☝️</p>
   {% endif %}
 </div>
 
 <script>
 const pollers = {};
+const lastLog = {};
+const loadingState = {};
 
 function escapeHtml(s){
-  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;',
+    '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function getItem(filename){
-  return document.querySelector('.file-item[data-file="' + CSS.escape(filename) + '"]');
+  return document.querySelector('.file-item[data-file="' +
+    CSS.escape(filename) + '"]');
 }
 
 async function startFile(filename, btn){
-  btn.disabled = true; btn.textContent = '⏳ Starting...';
+  btn.disabled = true;
+  btn.textContent = '⏳ Starting...';
   try{
-    const res = await fetch('/start/' + encodeURIComponent(filename), {method:'POST'});
+    const res = await fetch('/start/' + encodeURIComponent(filename),
+      {method:'POST'});
     const data = await res.json();
     if(data.ok){
       const item = getItem(filename);
       item.dataset.running = '1';
+      item.classList.add('running');
       item.querySelector('.status-dot').classList.add('running');
       item.querySelector('.run-btn').style.display = 'none';
       item.querySelector('.stop-btn').style.display = '';
-      const box = item.querySelector('.output-box');
-      box.style.display = 'block';
+      const wrap = item.querySelector('.output-wrap');
+      wrap.style.display = 'block';
+      showLoading(filename);
       startPolling(filename);
     } else {
       alert('Error: ' + (data.error || 'unknown'));
@@ -420,17 +483,29 @@ async function startFile(filename, btn){
 }
 
 async function stopFile(filename, btn){
-  btn.disabled = true; btn.textContent = '⏳ Stopping...';
+  btn.disabled = true;
+  btn.textContent = '⏳ Stopping...';
   try{
-    const res = await fetch('/stop/' + encodeURIComponent(filename), {method:'POST'});
-    const data = await res.json();
+    await fetch('/stop/' + encodeURIComponent(filename), {method:'POST'});
     const item = getItem(filename);
     item.dataset.running = '0';
+    item.classList.remove('running');
     item.querySelector('.status-dot').classList.remove('running');
     item.querySelector('.run-btn').style.display = '';
     item.querySelector('.stop-btn').style.display = 'none';
+    stopPolling(filename);
+    fetchLog(filename);  // শেষ লগটা দেখাই
   }catch(e){ alert('Error: ' + e); }
   finally{ btn.disabled = false; btn.textContent = '■ Stop'; }
+}
+
+function showLoading(filename){
+  const item = getItem(filename);
+  const head = item.querySelector('.output-head span:first-child');
+  const box = item.querySelector('.output-box');
+  head.innerHTML = '<span class="spinner"></span>Loading output...';
+  box.innerHTML = '';
+  loadingState[filename] = true;
 }
 
 async function fetchLog(filename){
@@ -438,13 +513,48 @@ async function fetchLog(filename){
     const res = await fetch('/log/' + encodeURIComponent(filename));
     const data = await res.json();
     const item = getItem(filename);
+    const head = item.querySelector('.output-head span:first-child');
+    const timeEl = item.querySelector('.output-head span:last-child');
     const box = item.querySelector('.output-box');
-    const wasBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-    box.innerHTML = '<span class="label">Live Output' +
-      (item.dataset.running === '1' ? ' ● Running' : '') + '</span>' +
-      (data.log ? escapeHtml(data.log) : '<span style="color:#555">(no output yet)</span>');
-    if(wasBottom) box.scrollTop = box.scrollHeight;
-  }catch(e){}
+    const log = data.log || '';
+    const isRun = item.dataset.running === '1';
+
+    // প্রথম লোডিং শেষ হলে হেড আপডেট
+    if(loadingState[filename] && log.length > 0){
+      loadingState[filename] = false;
+    }
+
+    if(loadingState[filename]){
+      head.innerHTML = '<span class="spinner"></span>Loading output...';
+    } else if(isRun){
+      head.innerHTML = '<span class="live">● Live Output</span>';
+    } else {
+      head.innerHTML = 'Final Output';
+    }
+    timeEl.textContent = new Date().toLocaleTimeString();
+
+    // এরর ডিটেকশন
+    const hasError = /Traceback|Error:|Exception|\\u274c/i.test(log);
+
+    // content আপডেট — শুধু বদলালে
+    if(lastLog[filename] !== log){
+      lastLog[filename] = log;
+      const wasBottom =
+        box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+
+      if(!log){
+        box.innerHTML = loadingState[filename]
+          ? '<span style="color:#555">Waiting for output...</span>'
+          : '<span style="color:#555">(no output)</span>';
+      } else {
+        box.innerHTML = escapeHtml(log);
+      }
+      if(hasError) box.classList.add('error');
+      else box.classList.remove('error');
+
+      if(wasBottom) box.scrollTop = box.scrollHeight;
+    }
+  }catch(e){ /* নীরব */ }
 }
 
 function startPolling(filename){
@@ -452,43 +562,41 @@ function startPolling(filename){
   fetchLog(filename);
   pollers[filename] = setInterval(async () => {
     const item = getItem(filename);
-    if(!item) { clearInterval(pollers[filename]); delete pollers[filename]; return; }
-    if(item.dataset.running !== '1' && item.querySelector('.output-box').style.display === 'none'){
-      clearInterval(pollers[filename]); delete pollers[filename]; return;
-    }
+    if(!item){ clearInterval(pollers[filename]);
+      delete pollers[filename]; return; }
     await fetchLog(filename);
-    // স্টেটাস চেক
+    // স্টেটাস সিঙ্ক
     try{
       const r = await fetch('/status/' + encodeURIComponent(filename));
       const s = await r.json();
       if(!s.running && item.dataset.running === '1'){
         item.dataset.running = '0';
+        item.classList.remove('running');
         item.querySelector('.status-dot').classList.remove('running');
         item.querySelector('.run-btn').style.display = '';
         item.querySelector('.stop-btn').style.display = 'none';
+        clearInterval(pollers[filename]);
+        delete pollers[filename];
+        fetchLog(filename);
       }
     }catch(e){}
-  }, 1500);
+  }, 1200);
 }
 
-function toggleLog(filename, btn){
-  const item = getItem(filename);
-  const box = item.querySelector('.output-box');
-  if(box.style.display === 'none'){
-    box.style.display = 'block';
-    startPolling(filename);
-  } else {
-    box.style.display = 'none';
+function stopPolling(filename){
+  if(pollers[filename]){
+    clearInterval(pollers[filename]);
+    delete pollers[filename];
   }
 }
 
-// পেজ লোডে চলমান সব ফাইলের পোলিং শুরু
-document.querySelectorAll('.file-item[data-running="1"]').forEach(item => {
-  item.querySelector('.output-box').style.display = 'block';
+// পেজ লোডে চলমান সব ফাইলের পোলিং চালু
+document.querySelectorAll('.file-item').forEach(item => {
+  const wrap = item.querySelector('.output-wrap');
+  if(wrap) wrap.style.display = 'block';
   startPolling(item.dataset.file);
 });
 
-// পেজ বন্ধ হলে পোলিং বন্ধ
 window.addEventListener('beforeunload', () => {
   Object.values(pollers).forEach(clearInterval);
 });
@@ -497,7 +605,7 @@ window.addEventListener('beforeunload', () => {
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Dashboard — ETHBD Hosting")
 
 
-# ---------------- routes ----------------
+# ================= routes =================
 @app.route('/')
 def index():
     if 'user' in session:
@@ -521,7 +629,7 @@ def register():
         save_users(users)
         os.makedirs(os.path.join(UPLOAD_FOLDER, username), exist_ok=True)
         session['user'] = username
-        flash('Account created successfully! 🎉', 'success')
+        flash('Account created! 🎉 You can start uploading now.', 'success')
         return redirect(url_for('dashboard'))
     return render_template_string(REGISTER_PAGE)
 
@@ -534,7 +642,7 @@ def login():
         users = load_users()
         if username in users and users[username]['password'] == hash_password(password):
             session['user'] = username
-            flash('Logged in successfully! ✅', 'success')
+            flash('Logged in! ✅', 'success')
             return redirect(url_for('dashboard'))
         flash('Invalid username or password.', 'error')
     return render_template_string(LOGIN_PAGE)
@@ -553,9 +661,10 @@ def dashboard():
     user = session['user']
     user_dir = os.path.join(UPLOAD_FOLDER, user)
     os.makedirs(user_dir, exist_ok=True)
-    files = os.listdir(user_dir)
+    files = sorted(os.listdir(user_dir))
     running = [f for f in files if is_running(user, f)]
-    return render_template_string(DASHBOARD_PAGE, user=user, files=files, running=running)
+    return render_template_string(DASHBOARD_PAGE, user=user,
+                                  files=files, running=running)
 
 
 @app.route('/upload', methods=['POST'])
@@ -567,8 +676,17 @@ def upload_file():
     if 'file' in request.files:
         file = request.files['file']
         if file.filename:
-            file.save(os.path.join(user_dir, file.filename))
-            flash(f'File "{file.filename}" uploaded ✅', 'success')
+            fname = safe_filename(file.filename)
+            path = os.path.join(user_dir, fname)
+            file.save(path)
+            flash(f'File "{fname}" uploaded ✅', 'success')
+            # ⚡ অটো-স্টার্ট .py ফাইল
+            if fname.endswith('.py'):
+                ok, msg = start_process(user, fname)
+                if ok:
+                    flash(f'Auto-started "{fname}" 🚀 Running 24/7.', 'success')
+                else:
+                    flash(f'Auto-start failed: {msg}', 'error')
     return redirect(url_for('dashboard'))
 
 
@@ -576,8 +694,9 @@ def upload_file():
 @login_required
 def start_file(filename):
     user = session['user']
+    filename = safe_filename(filename)
     if not filename.endswith('.py'):
-        return jsonify({'ok': False, 'error': 'Only .py files can be executed.'})
+        return jsonify({'ok': False, 'error': 'Only .py files can run.'})
     if is_running(user, filename):
         return jsonify({'ok': True, 'msg': 'Already running.'})
     ok, msg = start_process(user, filename)
@@ -588,6 +707,7 @@ def start_file(filename):
 @login_required
 def stop_file(filename):
     user = session['user']
+    filename = safe_filename(filename)
     ok, msg = stop_process(user, filename)
     return jsonify({'ok': ok, 'msg': msg})
 
@@ -596,6 +716,7 @@ def stop_file(filename):
 @login_required
 def status_file(filename):
     user = session['user']
+    filename = safe_filename(filename)
     return jsonify({'running': is_running(user, filename)})
 
 
@@ -603,18 +724,15 @@ def status_file(filename):
 @login_required
 def log_file(filename):
     user = session['user']
-    # path traversal protection
-    if '/' in filename or '\\' in filename or '..' in filename:
-        return jsonify({'log': '', 'error': 'Invalid filename'})
+    filename = safe_filename(filename)
     log_path = get_log_path(user, filename)
     if not os.path.exists(log_path):
         return jsonify({'log': ''})
     try:
-        with open(log_path, 'r', errors='replace') as f:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             data = f.read()
-        # শেষ 50KB দেখাই (বড় লগে ব্রাউজার যেন আটকে না যায়)
-        if len(data) > 50_000:
-            data = '...[truncated]...\n' + data[-50_000:]
+        if len(data) > 100_000:
+            data = '...[truncated older output]...\n' + data[-100_000:]
         return jsonify({'log': data})
     except Exception as e:
         return jsonify({'log': '', 'error': str(e)})
@@ -627,13 +745,17 @@ def download_file(filename):
     return send_from_directory(os.path.join(UPLOAD_FOLDER, user), filename)
 
 
-# ---------------- run ----------------
+# ================= run =================
 if __name__ == '__main__':
+    print("\n🔄 Auto-starting all previously uploaded .py files...")
+    auto_start_all()
+    print("✅ Auto-start complete.\n")
+
     try:
         from pyngrok import ngrok
         public_url = ngrok.connect(5000).public_url
-        print(f"\n🌍 Public URL: {public_url}\n")
+        print(f"🌍 Public URL: {public_url}\n")
     except Exception as e:
-        print(f"\n⚠ ngrok চালু হয়নি ({e}). লোকাল: http://localhost:5000\n")
+        print(f"⚠ ngrok off ({e}). Local: http://localhost:5000\n")
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
