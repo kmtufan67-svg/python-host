@@ -1,3 +1,42 @@
+# ============================================================
+# 🔮 AUTO PACKAGE INSTALLER (Termux Magic Code)
+# Automatically installs missing packages — no errors
+# ============================================================
+import subprocess
+import sys
+import importlib
+
+REQUIRED_PACKAGES = {
+    "flask": "flask",
+    "requests": "requests",
+    "pyngrok": "pyngrok",
+}
+
+def _install_package(pip_name):
+    try:
+        print(f"📦 Installing missing package: {pip_name} ...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", pip_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        print(f"✅ Installed: {pip_name}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Could not install {pip_name}: {e}")
+        return False
+
+def _ensure_all_packages():
+    for module_name, pip_name in REQUIRED_PACKAGES.items():
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            _install_package(pip_name)
+
+_ensure_all_packages()
+# ============================================================
+
 import os
 import io
 import re
@@ -8,7 +47,7 @@ import sqlite3
 import hashlib
 import secrets
 import threading
-import subprocess
+import subprocess as _sp
 import sys
 import random
 import shutil
@@ -33,12 +72,16 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 ADMIN_USER = os.environ.get('ADMIN_USER', 'M1NX')
 
+# ============ TELEGRAM CONTACT ============
+TELEGRAM_HANDLE = "M1NXGAMINGVIP1"
+TELEGRAM_URL = f"https://t.me/{TELEGRAM_HANDLE}"
+
 # ============ AI CONFIG ============
 AI_API_KEY = os.environ.get('AI_API_KEY', "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")
 AI_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_MODEL   = "llama-3.3-70b-versatile"
 
-# ============ ADS (ডিফল্ট ৩টি অ্যাড) ============
+# ============ ADS (default 3 ads) ============
 ADS_JSON = os.environ.get('ADS_JSON', json.dumps([
     {
         "text": "🚀 <b>ETHBD Hosting</b> — Host your Python bot 24/7, absolutely free!",
@@ -180,9 +223,9 @@ def start_process(user, filename):
         kwargs['preexec_fn'] = os.setsid
 
     try:
-        proc = subprocess.Popen(
+        proc = _sp.Popen(
             [sys.executable, '-u', filepath],
-            stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            stdout=log_f, stderr=_sp.STDOUT, stdin=_sp.DEVNULL,
             cwd=user_dir,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'},
             **kwargs
@@ -225,7 +268,7 @@ def stop_process(user, filename):
             proc.terminate()
         try:
             proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        except _sp.TimeoutExpired:
             if os.name != 'nt':
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -253,13 +296,12 @@ def auto_start_all():
             if f.endswith('.py'):
                 try:
                     start_process(u, f)
-                    print(f"   ▶ {u}/{f}")
+                    print(f"   ▴ {u}/{f}")
                 except Exception as e:
                     print(f"   ⚠ {u}/{f}: {e}")
 
 
 def detect_error(log):
-    """Python রানটাইম ইরর ডিটেক্ট করে (উন্নত)"""
     if not log:
         return False
     patterns = [
@@ -353,7 +395,7 @@ def demo_fix(code, error_output):
     return fixed
 
 
-# ==================== HTML BASE (প্রিমিয়াম UI) ====================
+# ==================== HTML BASE ====================
 BASE = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -373,7 +415,7 @@ BASE = r"""
   body{background:
       radial-gradient(circle at 20% 0%, rgba(124,92,255,.15), transparent 40%),
       radial-gradient(circle at 80% 100%, rgba(124,92,255,.10), transparent 40%),
-      var(--bg);padding:16px;padding-bottom:60px;}
+      var(--bg);padding:16px;padding-bottom:100px;}
   .container{max-width:1100px;margin:0 auto;}
   header{display:flex;justify-content:space-between;align-items:center;
     padding:14px 18px;background:rgba(19,19,26,.75);border:1px solid var(--border);
@@ -637,6 +679,44 @@ BASE = r"""
   .side-link:hover{background:var(--card-hover);border-color:var(--accent);
     transform:translateX(-4px);}
   .side-link .desc{color:var(--muted);font-size:.75rem;margin-top:4px;}
+
+  /* ============ TELEGRAM CONTACT BUTTON ============ */
+  .tg-contact {
+    position: fixed;
+    bottom: 22px;
+    right: 22px;
+    z-index: 900;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px 12px 14px;
+    background: linear-gradient(135deg, #229ED9, #1c8ac0);
+    color: #fff;
+    text-decoration: none;
+    font-weight: 700;
+    font-size: .9rem;
+    border-radius: 50px;
+    box-shadow: 0 8px 24px rgba(34, 158, 217, .45);
+    transition: all .25s ease;
+    animation: tgFloat 2.8s ease-in-out infinite;
+  }
+  .tg-contact:hover {
+    transform: translateY(-3px) scale(1.04);
+    box-shadow: 0 12px 30px rgba(34, 158, 217, .65);
+    background: linear-gradient(135deg, #2ab0ee, #229ED9);
+    color: #fff;
+  }
+  .tg-contact svg {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+    filter: drop-shadow(0 0 6px rgba(255,255,255,.4));
+  }
+  @keyframes tgFloat {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-6px); }
+  }
+
   @media (max-width:768px){
     .nav-toggle{display:flex;align-items:center;justify-content:center;}
     .nav-links{display:none;position:absolute;top:100%;left:0;right:0;
@@ -658,6 +738,13 @@ BASE = r"""
     .stats-grid{grid-template-columns:repeat(2,1fr);}
     table{font-size:.75rem;}
     th,td{padding:8px 6px;}
+    .tg-contact {
+      padding: 10px 14px 10px 12px;
+      font-size: .82rem;
+      bottom: 16px;
+      right: 16px;
+    }
+    .tg-contact svg { width: 20px; height: 20px; }
   }
 </style>
 </head>
@@ -700,6 +787,18 @@ BASE = r"""
   {% block content %}{% endblock %}
 </div>
 
+<!-- ============ TELEGRAM CONTACT FLOATING BUTTON ============ -->
+<a href="https://t.me/M1NXGAMINGVIP1" target="_blank" rel="noopener"
+   class="tg-contact" title="Contact on Telegram">
+  <svg viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="120" cy="120" r="120" fill="#fff" opacity=".15"/>
+    <path fill="#fff" d="M98 175c-3.8 0-3.1-1.4-4.4-5l-11-36 85-50c4-2.5 7.7-1.1 4.7 1.6l-72 65-3.3 20.4c-.5 1.8-1.4 3.5-3.2 3.5z"/>
+    <path fill="#fff" opacity=".8" d="M98 175c2 0 2.9-.9 4-2l11-11-15-9-2 19c-.5 1.7.8 3 2 3z"/>
+    <path fill="#fff" d="M113 153l57 42c6.5 3.6 11.2 1.7 12.8-6l23-108c2.4-9.5-3.6-13.7-9.7-10.6L48 128c-9.3 3.7-9.2 9-.6 11.3l39 12 90-57c4.2-2.6 8-1.2 4.9 1.6L113 153z"/>
+  </svg>
+  <span>Contact: @M1NXGAMINGVIP1</span>
+</a>
+
 <!-- Sidebar for Python Code Logic -->
 <div class="sidebar-overlay" id="overlay" onclick="closeSidebar()"></div>
 <div class="sidebar" id="sidebar">
@@ -710,23 +809,23 @@ BASE = r"""
   <h3>Code Logic Examples</h3>
   <div class="side-link" onclick="showLogic('hello')">
     Hello World
-    <div class="desc">সবচেয়ে সহজ প্রোগ্রাম</div>
+    <div class="desc">The simplest possible program</div>
   </div>
   <div class="side-link" onclick="showLogic('bot')">
     Telegram Bot
-    <div class="desc">২৪/৭ চলা বট</div>
+    <div class="desc">24/7 running bot</div>
   </div>
   <div class="side-link" onclick="showLogic('flask')">
     Flask Web Server
-    <div class="desc">নিজের API বানান</div>
+    <div class="desc">Build your own API</div>
   </div>
   <div class="side-link" onclick="showLogic('scraper')">
     Web Scraper
-    <div class="desc">ওয়েবসাইট থেকে ডাটা</div>
+    <div class="desc">Fetch data from websites</div>
   </div>
   <div class="side-link" onclick="showLogic('loop')">
     Infinite Loop Task
-    <div class="desc">প্রতি সেকেন্ডে কাজ</div>
+    <div class="desc">Do work every second</div>
   </div>
 </div>
 
@@ -743,10 +842,10 @@ function closeSidebar(){
   document.getElementById('overlay').classList.remove('open');
 }
 const LOGICS = {
-  hello: `# Hello World - সবচেয়ে সহজ
+  hello: `# Hello World - simplest
 print("Hello from ETHBD Hosting! 🚀")
 print("This runs 24/7 on the server.")`,
-  bot: `# Telegram Bot - ২৪/৭ চলে
+  bot: `# Telegram Bot - 24/7 running
 # pip install python-telegram-bot
 from telegram.ext import Application, CommandHandler
 
@@ -852,7 +951,7 @@ INDEX_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 
 <div class="card">
   <h2>✨ Features</h2>
-  <p style="margin-bottom:8px;">▶ <b>Auto-run</b> — upload &amp; forget, runs forever</p>
+  <p style="margin-bottom:8px;">▸ <b>Auto-run</b> — upload &amp; forget, runs forever</p>
   <p style="margin-bottom:8px;">📜 <b>Live logs</b> — see output in real time</p>
   <p style="margin-bottom:8px;">🔧 <b>Auto error fix</b> — AI corrects bugs instantly</p>
   <p style="margin-bottom:8px;">📱 <b>Mobile-first</b> — perfect on phone</p>
@@ -1934,7 +2033,7 @@ except Exception as e:
 if __name__ == '__main__':
     try:
         from pyngrok import ngrok
-        print(f"\n🌍 {ngrok.connect(5000).public_url}\n")
+        print(f"\n🌐 {ngrok.connect(5000).public_url}\n")
     except Exception:
         print("\n⚠ http://localhost:5000\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
