@@ -10,6 +10,8 @@ import secrets
 import threading
 import subprocess
 import sys
+import random
+import shutil
 import requests
 from functools import wraps
 from flask import (Flask, request, redirect, url_for, render_template_string,
@@ -29,16 +31,28 @@ os.makedirs(LOGS_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# অ্যাডমিন ইউজারনেম (env-এ বদলাতে পারবেন)
 ADMIN_USER = os.environ.get('ADMIN_USER', 'M1NX')
 
-# ইরর-ফিক্স API (Groq কনফিগারেশন আপডেট করা হয়েছে)
-AI_API_KEY = "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"
+# ============ AI CONFIG ============
+AI_API_KEY = os.environ.get('AI_API_KEY', "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")
 AI_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_MODEL   = "llama-3.3-70b-versatile"
 
-# অ্যাডভার্টাইজমেন্ট (env থেকে JSON)
-ADS_JSON = os.environ.get('ADS_JSON', '[]')
+# ============ ADS (ডিফল্ট ৩টি অ্যাড) ============
+ADS_JSON = os.environ.get('ADS_JSON', json.dumps([
+    {
+        "text": "🚀 <b>ETHBD Hosting</b> — Host your Python bot 24/7, absolutely free!",
+        "url": "https://example.com"
+    },
+    {
+        "text": "⚡ <b>Need a VPS?</b> Get 50% off your first month with code <code>ETHBD50</code>",
+        "url": "https://example.com/vps"
+    },
+    {
+        "text": "💎 <b>Upgrade to Pro</b> — Unlimited files, priority support, custom domains!",
+        "url": "https://example.com/pro"
+    }
+]))
 
 running_processes = {}
 lock = threading.Lock()
@@ -244,6 +258,30 @@ def auto_start_all():
                     print(f"   ⚠ {u}/{f}: {e}")
 
 
+def detect_error(log):
+    """Python রানটাইম ইরর ডিটেক্ট করে (উন্নত)"""
+    if not log:
+        return False
+    patterns = [
+        r'Traceback \(most recent call last\)',
+        r'^\s*\w*(Error|Exception)\s*:',
+        r'SyntaxError',
+        r'IndentationError',
+        r'ModuleNotFoundError',
+        r'ImportError',
+        r'NameError',
+        r'TypeError',
+        r'ValueError',
+        r'ZeroDivisionError',
+        r'KeyError',
+        r'IndexError',
+        r'AttributeError',
+        r'FileNotFoundError',
+        r'❌',
+    ]
+    return any(re.search(p, log, re.MULTILINE | re.IGNORECASE) for p in patterns)
+
+
 # ==================== AI ERROR FIX ====================
 AI_SYSTEM_PROMPT = """You are an expert Python debugger.
 The user gives you Python source code and its runtime error output.
@@ -257,10 +295,8 @@ Do NOT wrap the response in markdown fences. Return pure JSON only."""
 
 
 def ai_fix_code(code, error_output):
-    """AI দিয়ে কোড ঠিক করে। রিটার্ন করে (fixed_code, explanation, elapsed)"""
     start = time.time()
     if not AI_API_KEY:
-        # ডেমো মোড: সাধারণ ইরর হ্যান্ডলিং
         time.sleep(1.5)
         return demo_fix(code, error_output), \
                "Demo fix (no AI key configured). Added basic guards.", \
@@ -294,34 +330,30 @@ def ai_fix_code(code, error_output):
 
 
 def demo_fix(code, error_output):
-    """API key না থাকলে বেসিক অটো-ফিক্স"""
     fixed = code
-    # নাম না থাকলে import যোগ
     if 'NameError' in error_output:
         m = re.search(r"name '(\w+)' is not defined", error_output)
         if m:
             name = m.group(1)
-            if name in ('random',):
+            if name == 'random':
                 fixed = "import random\n" + fixed
-            elif name in ('time',):
+            elif name == 'time':
                 fixed = "import time\n" + fixed
-            elif name in ('os',):
+            elif name == 'os':
                 fixed = "import os\n" + fixed
-            elif name in ('sys',):
+            elif name == 'sys':
                 fixed = "import sys\n" + fixed
-            elif name in ('math',):
+            elif name == 'math':
                 fixed = "import math\n" + fixed
-    # ZeroDivisionError হলে guard
     if 'ZeroDivisionError' in error_output:
         fixed = re.sub(r'(\w+)\s*/\s*(\w+)',
                        r'(\1 / \2 if \2 != 0 else 0)', fixed)
-    # print এ parenthesis না থাকলে Python3 এ ঠিক করা
     fixed = re.sub(r'^(\s*)print\s+([^\(].*)$',
                    r'\1print(\2)', fixed, flags=re.MULTILINE)
     return fixed
 
 
-# ==================== HTML BASE ====================
+# ==================== HTML BASE (প্রিমিয়াম UI) ====================
 BASE = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -329,7 +361,7 @@ BASE = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{% block title %}ETHBD Hosting{% endblock %}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root{--bg:#0a0a0f;--card:#13131a;--card-hover:#1a1a24;--border:#26262f;
     --text:#e6e6ee;--muted:#8b8b9a;--accent:#7c5cff;--accent-hover:#6b4bff;
@@ -347,7 +379,7 @@ BASE = r"""
     padding:14px 18px;background:rgba(19,19,26,.75);border:1px solid var(--border);
     border-radius:var(--radius);backdrop-filter:blur(12px);margin-bottom:24px;
     position:sticky;top:8px;z-index:100;}
-  .logo{font-weight:700;font-size:1.05rem;
+  .logo{font-weight:800;font-size:1.05rem;
     background:linear-gradient(90deg,#7c5cff,#b794ff);
     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
     text-decoration:none;display:flex;align-items:center;gap:6px;}
@@ -426,14 +458,138 @@ BASE = r"""
     animation:spin .7s linear infinite;display:inline-block;
     vertical-align:middle;margin-right:6px;}
   @keyframes spin{to{transform:rotate(360deg);}}
-  .fix-panel{margin-top:12px;padding:14px;background:rgba(245,158,11,.08);
-    border:1px solid rgba(245,158,11,.3);border-radius:10px;}
-  .fix-panel h4{font-size:.9rem;color:#fbbf24;margin-bottom:8px;
-    display:flex;align-items:center;gap:6px;}
-  .fix-progress{height:6px;background:rgba(255,255,255,.08);
-    border-radius:6px;overflow:hidden;margin:10px 0;}
-  .fix-progress-bar{height:100%;background:linear-gradient(90deg,#f59e0b,#fbbf24);
-    width:0%;transition:width .4s;border-radius:6px;}
+
+  /* ============ PREMIUM AD BOX ============ */
+  .ad-box{
+    background:linear-gradient(135deg,rgba(124,92,255,.18),rgba(183,148,255,.06));
+    border:1px solid rgba(124,92,255,.35);
+    border-radius:14px;
+    padding:16px 20px;
+    margin-bottom:20px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:14px;
+    flex-wrap:wrap;
+    position:relative;
+    overflow:hidden;
+    box-shadow:0 4px 24px rgba(124,92,255,.12);
+    animation:adGlow 3s ease-in-out infinite;
+  }
+  .ad-box::before{
+    content:'';
+    position:absolute;
+    top:-50%;left:-50%;
+    width:200%;height:200%;
+    background:linear-gradient(45deg,transparent 30%,rgba(183,148,255,.08) 50%,transparent 70%);
+    animation:adShine 4s linear infinite;
+    pointer-events:none;
+  }
+  @keyframes adShine{0%{transform:translateX(-100%);}100%{transform:translateX(100%);}}
+  @keyframes adGlow{
+    0%,100%{box-shadow:0 4px 24px rgba(124,92,255,.12);}
+    50%{box-shadow:0 4px 32px rgba(124,92,255,.25);}
+  }
+  .ad-box .ad-label{
+    font-size:.65rem;
+    color:#b794ff;
+    text-transform:uppercase;
+    letter-spacing:.15em;
+    font-weight:700;
+    margin-bottom:4px;
+  }
+  .ad-box .ad-content{
+    flex:1;
+    font-size:.92rem;
+    color:#e6e6ee;
+    line-height:1.5;
+  }
+  .ad-box .ad-content b{color:#b794ff;}
+  .ad-box .ad-content code{
+    background:rgba(124,92,255,.2);
+    color:#b794ff;
+    padding:1px 6px;
+    border-radius:4px;
+    font-size:.85em;
+  }
+  .ad-box a{
+    color:#fff;
+    font-weight:700;
+    text-decoration:none;
+    padding:8px 16px;
+    background:linear-gradient(90deg,#7c5cff,#b794ff);
+    border-radius:8px;
+    font-size:.82rem;
+    transition:all .2s;
+    white-space:nowrap;
+  }
+  .ad-box a:hover{
+    transform:translateX(3px);
+    box-shadow:0 4px 16px rgba(124,92,255,.5);
+  }
+
+  /* ============ PREMIUM FIX PANEL ============ */
+  .fix-panel{
+    margin-top:14px;
+    padding:16px;
+    background:linear-gradient(135deg,rgba(245,158,11,.12),rgba(245,158,11,.04));
+    border:1px solid rgba(245,158,11,.4);
+    border-radius:12px;
+    position:relative;
+    overflow:hidden;
+    animation:fixPulse 2s ease-in-out infinite;
+  }
+  @keyframes fixPulse{
+    0%,100%{border-color:rgba(245,158,11,.4);}
+    50%{border-color:rgba(245,158,11,.7);}
+  }
+  .fix-panel h4{
+    font-size:.95rem;
+    color:#fbbf24;
+    margin-bottom:8px;
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-weight:700;
+  }
+  .fix-panel h4::before{
+    content:'🤖';
+    font-size:1.1rem;
+    animation:botBounce 1.5s ease-in-out infinite;
+  }
+  @keyframes botBounce{
+    0%,100%{transform:translateY(0);}
+    50%{transform:translateY(-3px);}
+  }
+  .fix-progress{
+    height:8px;
+    background:rgba(255,255,255,.1);
+    border-radius:8px;
+    overflow:hidden;
+    margin:12px 0;
+    position:relative;
+  }
+  .fix-progress-bar{
+    height:100%;
+    background:linear-gradient(90deg,#f59e0b,#fbbf24,#f59e0b);
+    background-size:200% 100%;
+    width:0%;
+    transition:width .4s;
+    border-radius:8px;
+    animation:progressShine 1.5s linear infinite;
+  }
+  @keyframes progressShine{
+    0%{background-position:200% 0;}
+    100%{background-position:-200% 0;}
+  }
+  .fix-status{
+    margin-top:10px;
+    text-align:center;
+    font-size:.85rem;
+    color:#fbbf24;
+    min-height:20px;
+  }
+
   .center{text-align:center;}
   .hero{text-align:center;padding:36px 8px;}
   .hero h1{font-size:2.2rem;margin-bottom:14px;}
@@ -446,14 +602,6 @@ BASE = r"""
     border:1px solid rgba(124,92,255,.3);margin-left:6px;}
   .badge.admin{background:rgba(239,68,68,.15);color:#fca5a5;
     border-color:rgba(239,68,68,.3);}
-  .ad-box{background:linear-gradient(135deg,rgba(124,92,255,.12),rgba(124,92,255,.04));
-    border:1px dashed rgba(124,92,255,.4);border-radius:10px;
-    padding:14px 18px;margin-bottom:20px;display:flex;
-    justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;}
-  .ad-box .ad-label{font-size:.68rem;color:var(--muted);
-    text-transform:uppercase;letter-spacing:.1em;}
-  .ad-box .ad-content{flex:1;font-size:.9rem;color:#b794ff;}
-  .ad-box a{color:var(--accent);font-weight:600;text-decoration:none;}
   .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
     gap:12px;margin-bottom:20px;}
   .stat{background:#0e0e14;border:1px solid var(--border);
@@ -535,8 +683,8 @@ BASE = r"""
 
   {% if ad %}
   <div class="ad-box">
-    <div>
-      <div class="ad-label">Sponsored</div>
+    <div style="flex:1;">
+      <div class="ad-label">✨ Sponsored</div>
       <div class="ad-content">{{ ad.text|safe }}</div>
     </div>
     {% if ad.url %}<a href="{{ ad.url }}" target="_blank">Visit →</a>{% endif %}
@@ -641,7 +789,7 @@ while True:
         print(f"✅ Status: {r.status_code}, Size: {len(r.text)} bytes")
     except Exception as e:
         print(f"❌ Error: {e}")
-    sleep(60)  # প্রতি ৬০ সেকেন্ডে`,
+    sleep(60)`,
   loop: `# Infinite Loop Task
 import time
 from datetime import datetime
@@ -673,10 +821,13 @@ def get_random_ad():
     try:
         ads = json.loads(ADS_JSON)
         if ads:
-            return ads[int(time.time()) % len(ads)]
+            return random.choice(ads)
     except Exception:
         pass
-    return {'text': '🚀 <b>Your ad here!</b> Contact admin.', 'url': ''}
+    return {
+        'text': '🚀 <b>Your ad here!</b> Contact admin to promote your product.',
+        'url': ''
+    }
 
 
 @app.context_processor
@@ -710,39 +861,139 @@ INDEX_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Welcome — ETHBD Hosting")
 
+
 REGISTER_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
-<div class="card" style="max-width:440px;margin:0 auto;">
-  <div class="center" style="margin-bottom:24px;">
-    <div style="font-size:2.5rem;">🚀</div>
-    <h2 style="margin-top:12px;">Create Account</h2>
-    <p class="muted">Register once — start hosting 24/7</p>
+<div class="card" style="max-width:460px;margin:0 auto;position:relative;overflow:hidden;">
+  <div style="position:absolute;top:-50px;right:-50px;width:150px;height:150px;
+    background:radial-gradient(circle,rgba(124,92,255,.25),transparent 70%);
+    border-radius:50%;pointer-events:none;"></div>
+  <div style="position:absolute;bottom:-60px;left:-60px;width:180px;height:180px;
+    background:radial-gradient(circle,rgba(183,148,255,.15),transparent 70%);
+    border-radius:50%;pointer-events:none;"></div>
+
+  <div class="center" style="margin-bottom:28px;position:relative;">
+    <div style="font-size:3rem;filter:drop-shadow(0 0 20px rgba(124,92,255,.5));">🚀</div>
+    <h2 style="margin-top:14px;font-size:1.5rem;
+      background:linear-gradient(90deg,#fff,#b794ff);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+      Create Account
+    </h2>
+    <p class="muted" style="margin-top:6px;">Register once — host Python 24/7 free</p>
   </div>
-  <form method="post" id="regForm">
-    <label>Username</label>
-    <input type="text" name="username" id="regUser" placeholder="username"
+
+  <form method="post" id="regForm" style="position:relative;">
+    <label>👤 Username</label>
+    <input type="text" name="username" id="regUser" placeholder="choose a username"
            pattern="[a-zA-Z0-9_]{3,30}" required
-           title="3-30 chars: letters, numbers, underscore">
-    <label>Password</label>
-    <input type="password" name="password" id="regPass" placeholder="password"
-           minlength="6" required>
-    <label>Confirm Password</label>
-    <input type="password" id="regPass2" placeholder="repeat password" required>
-    <button class="btn btn-block" type="submit">Create Account</button>
+           title="3-30 chars: letters, numbers, underscore"
+           oninput="checkUser(this.value)">
+
+    <label>🔒 Password</label>
+    <input type="password" name="password" id="regPass" placeholder="min 6 characters"
+           minlength="6" required oninput="checkStrength(this.value)">
+
+    <div style="height:6px;background:rgba(255,255,255,.08);border-radius:6px;
+      overflow:hidden;margin:-10px 0 14px;">
+      <div id="strengthBar" style="height:100%;width:0%;transition:all .3s;
+        border-radius:6px;background:#ef4444;"></div>
+    </div>
+    <p id="strengthText" class="muted" style="font-size:.75rem;margin-top:-10px;
+      margin-bottom:14px;"></p>
+
+    <label>🔐 Confirm Password</label>
+    <input type="password" id="regPass2" placeholder="repeat password" required
+           oninput="checkMatch()">
+    <p id="matchText" class="muted" style="font-size:.75rem;margin-top:-10px;
+      margin-bottom:14px;"></p>
+
+    <button class="btn btn-block" type="submit" id="regBtn">
+      ✨ Create Free Account
+    </button>
   </form>
-  <p class="muted center" style="margin-top:18px;">
-    Already have an account? <a class="auth-link" href="{{ url_for('login') }}">Login</a>
+
+  <div style="display:flex;align-items:center;gap:10px;margin:18px 0;">
+    <div style="flex:1;height:1px;background:var(--border);"></div>
+    <span class="muted" style="font-size:.75rem;">OR</span>
+    <div style="flex:1;height:1px;background:var(--border);"></div>
+  </div>
+
+  <p class="muted center" style="font-size:.9rem;">
+    Already have an account?
+    <a class="auth-link" href="{{ url_for('login') }}">Login →</a>
   </p>
+
+  <div style="margin-top:20px;padding:12px;background:rgba(124,92,255,.06);
+    border:1px solid rgba(124,92,255,.2);border-radius:10px;">
+    <p class="muted" style="font-size:.75rem;line-height:1.6;">
+      ✅ Free forever &nbsp;·&nbsp; ✅ Unlimited files &nbsp;·&nbsp; ✅ AI auto-fix<br>
+      ✅ 24/7 uptime &nbsp;·&nbsp; ✅ Live logs &nbsp;·&nbsp; ✅ No credit card
+    </p>
+  </div>
 </div>
+
 <script>
+function checkUser(v){
+  const el = document.getElementById('regUser');
+  if(v.length === 0){ el.style.borderColor = ''; return; }
+  if(/^[a-zA-Z0-9_]{3,30}$/.test(v)) el.style.borderColor = '#22c55e';
+  else el.style.borderColor = '#ef4444';
+}
+function checkStrength(p){
+  const bar = document.getElementById('strengthBar');
+  const txt = document.getElementById('strengthText');
+  let s = 0;
+  if(p.length >= 6) s++;
+  if(p.length >= 10) s++;
+  if(/[A-Z]/.test(p)) s++;
+  if(/[0-9]/.test(p)) s++;
+  if(/[^A-Za-z0-9]/.test(p)) s++;
+  const map = [
+    {w:'0%', c:'#ef4444', t:''},
+    {w:'25%', c:'#ef4444', t:'Weak password'},
+    {w:'45%', c:'#f59e0b', t:'Fair password'},
+    {w:'65%', c:'#f59e0b', t:'Good password'},
+    {w:'85%', c:'#22c55e', t:'Strong password'},
+    {w:'100%', c:'#22c55e', t:'💪 Very strong!'}
+  ];
+  const m = map[Math.min(s, 5)];
+  bar.style.width = m.w;
+  bar.style.background = m.c;
+  txt.textContent = m.t;
+  txt.style.color = m.c;
+}
+function checkMatch(){
+  const p1 = document.getElementById('regPass').value;
+  const p2 = document.getElementById('regPass2').value;
+  const el = document.getElementById('regPass2');
+  const txt = document.getElementById('matchText');
+  if(!p2){ el.style.borderColor = ''; txt.textContent = ''; return; }
+  if(p1 === p2){
+    el.style.borderColor = '#22c55e';
+    txt.textContent = '✅ Passwords match';
+    txt.style.color = '#22c55e';
+  } else {
+    el.style.borderColor = '#ef4444';
+    txt.textContent = '❌ Passwords do not match';
+    txt.style.color = '#ef4444';
+  }
+}
 document.getElementById('regForm').addEventListener('submit', function(e){
   const p1 = document.getElementById('regPass').value;
   const p2 = document.getElementById('regPass2').value;
-  if(p1 !== p2){ e.preventDefault(); alert('Passwords do not match!'); }
+  if(p1 !== p2){
+    e.preventDefault();
+    alert('❌ Passwords do not match!');
+    return;
+  }
+  const btn = document.getElementById('regBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Creating account...';
 });
 </script>
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Register — ETHBD Hosting")
+
 
 LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
@@ -765,6 +1016,7 @@ LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 </div>
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Login — ETHBD Hosting")
+
 
 DASHBOARD_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
@@ -893,8 +1145,9 @@ async function stopFile(f, btn){
   finally{ btn.disabled = false; btn.textContent = '■ Stop'; }
 }
 
-function detectError(log){
-  return /Traceback \(most recent call last\)|^\w*Error:|^\w*Exception:|❌|SyntaxError/i.test(log);
+function detectErrorJS(log){
+  if(!log) return false;
+  return /Traceback \(most recent call last\)|\b\w*(Error|Exception)\s*:|SyntaxError|IndentationError|ModuleNotFoundError|ImportError|NameError|TypeError|ValueError|ZeroDivisionError|KeyError|IndexError|AttributeError|FileNotFoundError|❌/i.test(log);
 }
 
 async function fetchLog(f){
@@ -902,6 +1155,7 @@ async function fetchLog(f){
     const r = await fetch('/log/'+encodeURIComponent(f));
     const d = await r.json();
     const item = getItem(f);
+    if(!item) return;
     const head = item.querySelector('.output-head span:first-child');
     const timeEl = item.querySelector('.output-head span:last-child');
     const box = item.querySelector('.output-box');
@@ -915,7 +1169,7 @@ async function fetchLog(f){
     else head.innerHTML = 'Final Output';
     timeEl.textContent = new Date().toLocaleTimeString();
 
-    const hasErr = detectError(log);
+    const hasErr = d.has_error || detectErrorJS(log);
 
     if(lastLog[f] !== log){
       lastLog[f] = log;
@@ -927,26 +1181,31 @@ async function fetchLog(f){
     }
 
     const fixPanel = item.querySelector('.fix-panel');
-    if(hasErr && !errState[f]){
+    if(hasErr){
+      if(fixPanel.style.display !== 'block'){
+        fixPanel.style.display = 'block';
+        item.classList.add('has-error');
+        item.querySelector('.status-dot').classList.add('error');
+        bindFixButton(f, item);
+      }
       errState[f] = true;
-      item.classList.add('has-error');
-      item.querySelector('.status-dot').classList.add('error');
-      fixPanel.style.display = 'block';
-      bindFixButton(f, item);
-    } else if(!hasErr && errState[f]){
+    } else {
+      if(fixPanel.style.display === 'block'){
+        fixPanel.style.display = 'none';
+        item.classList.remove('has-error');
+        item.querySelector('.status-dot').classList.remove('error');
+      }
       errState[f] = false;
-      item.classList.remove('has-error');
-      item.querySelector('.status-dot').classList.remove('error');
-      fixPanel.style.display = 'none';
     }
-  }catch(e){}
+  }catch(e){ console.warn('log fetch error', e); }
 }
 
 function bindFixButton(f, item){
   const btn = item.querySelector('.fix-btn');
-  if(!btn || btn.dataset.bound === '1') return;
-  btn.dataset.bound = '1';
-  btn.addEventListener('click', () => autoFix(f, item));
+  if(!btn) return;
+  const newBtn = btn.cloneNode(true);
+  btn.parentNode.replaceChild(newBtn, btn);
+  newBtn.addEventListener('click', () => autoFix(f, item));
 }
 
 async function autoFix(f, item){
@@ -960,7 +1219,6 @@ async function autoFix(f, item){
   progWrap.style.display = 'block';
   status.textContent = 'Analyzing error...';
 
-  // ফেক প্রগ্রেস (আসল সময় AI থেকে আসে)
   let p = 5;
   prog.style.width = p + '%';
   const ticker = setInterval(() => {
@@ -988,7 +1246,6 @@ async function autoFix(f, item){
         item.classList.remove('has-error');
         item.querySelector('.status-dot').classList.remove('error');
       }, 3000);
-      // নতুন কোড রান করি
       setTimeout(() => startFile(f, item.querySelector('.run-btn')), 500);
     } else {
       status.innerHTML = '❌ ' + escapeHtml(d.error || 'Fix failed');
@@ -1067,6 +1324,7 @@ window.addEventListener('beforeunload', () => {
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Dashboard — ETHBD Hosting")
 
+
 SETTINGS_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="card" style="max-width:500px;margin:0 auto;">
@@ -1098,6 +1356,7 @@ SETTINGS_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Settings — ETHBD Hosting")
 
+
 ADMIN_LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="card" style="max-width:420px;margin:0 auto;border-color:rgba(239,68,68,.4);">
@@ -1119,6 +1378,7 @@ ADMIN_LOGIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 </div>
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Admin Login")
+
 
 ADMIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
@@ -1187,6 +1447,7 @@ ADMIN_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 </div>
 {% endblock %}
 """).replace("{% block title %}ETHBD Hosting{% endblock %}", "Admin Panel")
+
 
 ADMIN_USER_PAGE = BASE.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
@@ -1377,15 +1638,18 @@ def log_file(filename):
     filename = safe_filename(filename)
     log_path = get_log_path(u, filename)
     if not os.path.exists(log_path):
-        return jsonify({'log': ''})
+        return jsonify({'log': '', 'has_error': False})
     try:
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             data = f.read()
         if len(data) > 100_000:
             data = '...[truncated]...\n' + data[-100_000:]
-        return jsonify({'log': data})
+        return jsonify({
+            'log': data,
+            'has_error': detect_error(data)
+        })
     except Exception as e:
-        return jsonify({'log': '', 'error': str(e)})
+        return jsonify({'log': '', 'has_error': False, 'error': str(e)})
 
 
 @app.route('/get-code/<filename>')
@@ -1415,7 +1679,6 @@ def save_code(filename):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(code)
         log_activity(u, 'edit', filename)
-        # রিস্টার্ট
         if is_running(u, filename):
             stop_process(u, filename)
             time.sleep(0.5)
@@ -1452,7 +1715,6 @@ def fix_file(filename):
 
     fixed, explanation, elapsed = ai_fix_code(code, error_output)
 
-    # ব্যাকআপ
     try:
         with open(path + '.bak', 'w', encoding='utf-8') as f:
             f.write(code)
@@ -1464,7 +1726,6 @@ def fix_file(filename):
 
     log_activity(u, 'ai-fix', filename)
 
-    # রিস্টার্ট
     if is_running(u, filename):
         stop_process(u, filename)
         time.sleep(0.3)
@@ -1472,12 +1733,6 @@ def fix_file(filename):
 
     return jsonify({'ok': True, 'explanation': explanation,
                     'elapsed': round(elapsed, 1)})
-
-
-def detect_error(log):
-    return bool(re.search(
-        r'Traceback \(most recent call last\)|^\w*Error:|^\w*Exception:|❌|SyntaxError',
-        log, re.MULTILINE))
 
 
 @app.route('/settings')
@@ -1525,12 +1780,9 @@ def delete_account():
         conn.close()
         flash('Password is wrong.', 'error')
         return redirect(url_for('settings'))
-    # সব প্রসেস বন্ধ
     with lock:
         for fname in list(running_processes.get(u, {}).keys()):
             stop_process(u, fname)
-    # ফাইল মুছি
-    import shutil
     udir = os.path.join(UPLOAD_FOLDER, u)
     if os.path.isdir(udir):
         shutil.rmtree(udir, ignore_errors=True)
